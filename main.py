@@ -1,14 +1,25 @@
+import atexit
 import json
 import random
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
+from posthog import Posthog
 from pydantic import BaseModel
 import requests
 import os
 
+load_dotenv()
 
 FMCSA_KEY = os.getenv("FMCSA_WEB_KEY")
 API_KEY = os.getenv("API_KEY")
+
+posthog_client = Posthog(
+    os.getenv("POSTHOG_PROJECT_TOKEN", ""),
+    host=os.getenv("POSTHOG_HOST", "https://us.i.posthog.com"),
+    enable_exception_autocapture=True,
+)
+atexit.register(posthog_client.shutdown)
 
 
 app = FastAPI()
@@ -86,6 +97,7 @@ class AnalyticsPayload(BaseModel):
     date_starting: str | None = None
     call_classification: str | None = None
     sentiment_classification: str | None = None
+    negotiated: bool | None = None
 
 def get_carrier_by_docket(docket_number: str) -> dict:
     url = f"{FMCSA_BASE_URL}/carriers/docket-number/{docket_number}"
@@ -96,6 +108,9 @@ def get_carrier_by_docket(docket_number: str) -> dict:
     response = requests.get(url, params=params, headers=headers, timeout=10)
 
     if response.status_code != 200:
+        posthog_client.capture("server", "carrier_check_failed", properties={
+            "status_code": response.status_code,
+        })
         raise HTTPException(
             status_code=response.status_code,
             detail=f"FMCSA request failed: {response.text}"
@@ -166,6 +181,15 @@ def check_carrier(
     # 3. Evaluate validity
     result = evaluate_carrier(carrier)
 
+    posthog_client.capture("server", "carrier_checked", properties={
+        "can_book_load": result["can_book_load"],
+        "has_issues": len(result["issues"]) > 0,
+        "issue_count": len(result["issues"]),
+        "authority_status": result["carrier"]["authority"],
+        "power_units": result["carrier"]["power_units"],
+        "carrier_state": result["carrier"]["state"],
+    })
+
     return result
 
 @app.post("/load")
@@ -181,8 +205,10 @@ def get_load(payload: LoadRequest, x_api_key: str = Header(None)):
 
     # load_id takes precedence
     if payload.load_id != "":
+        selection_method = "by_id"
         load_id = payload.load_id
     elif payload.state != "":
+        selection_method = "by_state"
         # Search for a load in the provided state
         state_input = payload.state.casefold()
         state_abbr = None
@@ -194,6 +220,10 @@ def get_load(payload: LoadRequest, x_api_key: str = Header(None)):
                 break
 
         if not state_abbr:
+            posthog_client.capture("server", "load_not_found", properties={
+                "selection_method": selection_method,
+                "reason": "invalid_state",
+            })
             raise HTTPException(status_code=400, detail=f"Invalid state: {payload.state}")
 
         # Filter loads by state (origin ends with ", STATE")
@@ -203,18 +233,31 @@ def get_load(payload: LoadRequest, x_api_key: str = Header(None)):
         }
 
         if not matching_loads:
+            posthog_client.capture("server", "load_not_found", properties={
+                "selection_method": selection_method,
+                "reason": "no_matching_loads",
+            })
             raise HTTPException(status_code=404, detail=f"No loads found for state: {payload.state}")
 
         load_id = random.choice(list(matching_loads.keys()))
     else:
+        selection_method = "random"
         # No load_id or state provided, pick random
         load_id = random.choice(list(loads.keys()))
 
     load = loads.get(load_id)
 
     if not load:
+        posthog_client.capture("server", "load_not_found", properties={
+            "selection_method": selection_method,
+            "reason": "load_id_not_found",
+        })
         raise HTTPException(status_code=404, detail="Load not found")
 
+
+    posthog_client.capture("server", "load_retrieved", properties={
+        "selection_method": selection_method,
+    })
 
     return {
         "status": "success",
@@ -228,6 +271,24 @@ async def analytics(
 ):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401)
+
+    if payload.mc_number and payload.carrier_name:
+        posthog_client.set(
+            distinct_id=payload.mc_number,
+            properties={"carrier_name": payload.carrier_name},
+        )
+
+    posthog_client.capture(
+        distinct_id=payload.mc_number or "unknown",
+        event="call_completed",
+        properties={
+            "rate": payload.rate or None,
+            "agreement": payload.agreement,
+            "call_classification": payload.call_classification,
+            "sentiment_classification": payload.sentiment_classification,
+            "negotiated": payload.negotiated,
+        },
+    )
 
     return {
         "success": True

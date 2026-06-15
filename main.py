@@ -94,7 +94,6 @@ class AnalyticsPayload(BaseModel):
     agreement: bool | None = None
     mc_number: str | None = None
     carrier_name: str | None = None
-    date_starting: str | None = None
     call_classification: str | None = None
     sentiment_classification: str | None = None
     negotiated: bool | None = None
@@ -111,6 +110,7 @@ def get_carrier_by_docket(docket_number: str) -> dict:
         posthog_client.capture("server", "carrier_check_failed", properties={
             "status_code": response.status_code,
         })
+        posthog_client.flush()
         raise HTTPException(
             status_code=response.status_code,
             detail=f"FMCSA request failed: {response.text}"
@@ -189,6 +189,7 @@ def check_carrier(
         "power_units": result["carrier"]["power_units"],
         "carrier_state": result["carrier"]["state"],
     })
+    posthog_client.flush()
 
     return result
 
@@ -224,6 +225,7 @@ def get_load(payload: LoadRequest, x_api_key: str = Header(None)):
                 "selection_method": selection_method,
                 "reason": "invalid_state",
             })
+            posthog_client.flush()
             raise HTTPException(status_code=400, detail=f"Invalid state: {payload.state}")
 
         # Filter loads by state (origin ends with ", STATE")
@@ -237,6 +239,7 @@ def get_load(payload: LoadRequest, x_api_key: str = Header(None)):
                 "selection_method": selection_method,
                 "reason": "no_matching_loads",
             })
+            posthog_client.flush()
             raise HTTPException(status_code=404, detail=f"No loads found for state: {payload.state}")
 
         load_id = random.choice(list(matching_loads.keys()))
@@ -252,12 +255,14 @@ def get_load(payload: LoadRequest, x_api_key: str = Header(None)):
             "selection_method": selection_method,
             "reason": "load_id_not_found",
         })
+        posthog_client.flush()
         raise HTTPException(status_code=404, detail="Load not found")
 
 
     posthog_client.capture("server", "load_retrieved", properties={
         "selection_method": selection_method,
     })
+    posthog_client.flush()
 
     return {
         "status": "success",
@@ -277,6 +282,25 @@ async def analytics(
             distinct_id=payload.mc_number,
             properties={"carrier_name": payload.carrier_name},
         )
+        posthog_client.flush()
+
+    # Query load data if load_id provided
+    load_data = {}
+    if payload.load_id:
+        with open("loads.json", "r") as f:
+            loads = json.load(f)
+        load = loads.get(payload.load_id)
+        if load:
+            origin_state = load["origin"].split(", ")[1] if ", " in load["origin"] else None
+            destination_state = load["destination"].split(", ")[1] if ", " in load["destination"] else None
+            
+            load_data = {
+                "equipment_type": load.get("equipment_type"),
+                "commodity_type": load.get("commodity_type"),
+                "miles": load.get("miles"),
+                "origin_state": origin_state,
+                "destination_state": destination_state,
+            }
 
     posthog_client.capture(
         distinct_id=payload.mc_number or "unknown",
@@ -287,8 +311,10 @@ async def analytics(
             "call_classification": payload.call_classification,
             "sentiment_classification": payload.sentiment_classification,
             "negotiated": payload.negotiated,
+            **load_data,
         },
     )
+    posthog_client.flush()
 
     return {
         "success": True
